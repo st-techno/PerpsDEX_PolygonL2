@@ -1,13 +1,26 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.21;
 
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+// Import OpenZeppelin libraries for upgradability, access control, and logging
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-contract PerpetualDEX {
-    using SafeMath for uint256;
-    
-    // Gas-optimized struct packing
+// Perpetual DEX with Access Control, Circuit Breaker, Logging, Gas Station, and Proxy Upgradability
+contract PerpetualDEX is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // --- Roles ---
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
+
+    // --- Structs ---
     struct Position {
         uint128 size;
         uint128 collateral;
@@ -17,43 +30,75 @@ contract PerpetualDEX {
         uint80 leverage;
     }
 
-    // Gas-efficient storage layout
-    address public immutable collateralToken;
-    AggregatorV3Interface public immutable priceFeed;
-    
+    // --- State Variables ---
+    address public collateralToken;
+    AggregatorV3Interface public priceFeed;
+
     uint256 public totalLongs;
     uint256 public totalShorts;
     uint256 public fundingRate;
     uint256 public constant FUNDING_INTERVAL = 8 hours;
-    
+
     mapping(address => Position[]) public positions;
     mapping(address => uint256) public feeReserves;
 
-    // Events for off-chain tracking
-    event PositionOpened(address indexed user, uint256 indexed positionId);
-    event PositionClosed(address indexed user, uint256 indexed positionId);
-    event PositionLiquidated(address indexed user, uint256 indexed positionId);
+    // --- Events (Logging) ---
+    event PositionOpened(address indexed user, uint256 indexed positionId, uint256 size, bool isLong);
+    event PositionClosed(address indexed user, uint256 indexed positionId, uint256 pnl);
+    event PositionLiquidated(address indexed user, uint256 indexed positionId, address liquidator);
+    event CircuitBreakerActivated(address indexed admin);
+    event CircuitBreakerDeactivated(address indexed admin);
+    event Upgraded(address indexed newImplementation);
 
-    constructor(address _collateralToken, address _priceFeed) {
+    // --- Initializer ---
+    function initialize(address _collateralToken, address _priceFeed) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
         collateralToken = _collateralToken;
         priceFeed = AggregatorV3Interface(_priceFeed);
+
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _setupRole(ADMIN_ROLE, msg.sender);
     }
 
-    // Gas-optimized main functions
+    // --- Access Control Modifiers ---
+    modifier onlyAdmin() {
+        require(hasRole(ADMIN_ROLE, msg.sender), "Not admin");
+        _;
+    }
+
+    modifier onlyKeeper() {
+        require(hasRole(KEEPER_ROLE, msg.sender), "Not keeper");
+        _;
+    }
+
+    // --- Circuit Breaker (Pausable) ---
+    function activateCircuitBreaker() external onlyAdmin {
+        _pause();
+        emit CircuitBreakerActivated(msg.sender);
+    }
+
+    function deactivateCircuitBreaker() external onlyAdmin {
+        _unpause();
+        emit CircuitBreakerDeactivated(msg.sender);
+    }
+
+    // --- Core DEX Functions (with Pausable) ---
     function openPosition(
         uint256 size,
         uint256 collateral,
         bool isLong,
         uint80 leverage
-    ) external {
+    ) external whenNotPaused {
         require(leverage <= 100, "Exceeds max leverage");
-        
         _transferCollateral(collateral);
         _updateFundingRate();
-        
+
         (int256 currentPrice,) = _getPrice();
         uint256 fee = _calculateFee(size);
-        
+
         positions[msg.sender].push(Position({
             size: uint128(size),
             collateral: uint128(collateral),
@@ -62,98 +107,129 @@ contract PerpetualDEX {
             timestamp: uint32(block.timestamp),
             leverage: leverage
         }));
-        
+
         _updateOpenInterest(isLong, size);
         feeReserves[msg.sender] += fee;
-        
-        emit PositionOpened(msg.sender, positions[msg.sender].length - 1);
+
+        emit PositionOpened(msg.sender, positions[msg.sender].length - 1, size, isLong);
     }
 
-    function closePosition(uint256 positionId) external {
+    function closePosition(uint256 positionId) external whenNotPaused {
         Position storage position = positions[msg.sender][positionId];
         require(position.size > 0, "Invalid position");
-        
+
         _updateFundingRate();
         (int256 currentPrice,) = _getPrice();
-        
+
         uint256 pnl = _calculatePnl(position, currentPrice);
         uint256 totalAmount = position.collateral + pnl;
-        
+
         delete positions[msg.sender][positionId];
         _updateOpenInterest(position.isLong, -int256(position.size));
-        
+
         _transfer(msg.sender, totalAmount);
-        emit PositionClosed(msg.sender, positionId);
+        emit PositionClosed(msg.sender, positionId, pnl);
     }
 
-    // Gas-efficient price retrieval
+    function liquidatePosition(address user, uint256 positionId) external whenNotPaused onlyKeeper {
+        Position storage position = positions[user][positionId];
+        (int256 currentPrice,) = _getPrice();
+
+        require(_isUnderwater(position, currentPrice), "Position safe");
+        feeReserves[msg.sender] += position.collateral / 10; // 10% liquidation fee
+
+        delete positions[user][positionId];
+        emit PositionLiquidated(user, positionId, msg.sender);
+    }
+
+    // --- Polygon Gas Station Network (Meta-Transactions) ---
+    // Accepts relayed transactions via trusted forwarder (Polygon GSN)
+    address public trustedForwarder;
+
+    function setTrustedForwarder(address _forwarder) external onlyAdmin {
+        trustedForwarder = _forwarder;
+    }
+
+    function isTrustedForwarder(address forwarder) public view returns (bool) {
+        return forwarder == trustedForwarder;
+    }
+
+    function _msgSender() internal view returns (address sender) {
+        if (msg.data.length >= 24 && isTrustedForwarder(msg.sender)) {
+            // Extract sender address from end of calldata (EIP-2771)
+            assembly {
+                sender := shr(96, calldataload(sub(calldatasize(), 20)))
+            }
+        } else {
+            sender = msg.sender;
+        }
+    }
+
+    // --- Upgradability (UUPS) ---
+    function _authorizeUpgrade(address newImplementation) internal override onlyAdmin {
+        emit Upgraded(newImplementation);
+    }
+
+    // --- Internal Helper Functions ---
     function _getPrice() internal view returns (int256, uint256) {
         (, int256 price,, uint256 updatedAt,) = priceFeed.latestRoundData();
         require(updatedAt >= block.timestamp - 60, "Stale price");
         return (price, updatedAt);
     }
 
-    // Optimized fee calculation
     function _calculateFee(uint256 size) internal pure returns (uint256) {
-        return size.mul(5).div(10000); // 0.05% fee
+        return size * 5 / 10000; // 0.05%
     }
 
-    // Batch-compatible collateral handling
     function _transferCollateral(uint256 amount) internal {
         IERC20(collateralToken).transferFrom(msg.sender, address(this), amount);
     }
 
-    // Gas-efficient storage management
-    function _updateOpenInterest(bool isLong, uint256 amount) internal {
+    function _transfer(address to, uint256 amount) internal {
+        IERC20(collateralToken).transfer(to, amount);
+    }
+
+    function _updateOpenInterest(bool isLong, int256 amount) internal {
         if (isLong) {
-            totalLongs += amount;
+            totalLongs = uint256(int256(totalLongs) + amount);
         } else {
-            totalShorts += amount;
+            totalShorts = uint256(int256(totalShorts) + amount);
         }
     }
 
-    // Funding rate mechanism
     function _updateFundingRate() internal {
         if (block.timestamp % FUNDING_INTERVAL == 0) {
-            uint256 imbalance = totalLongs > totalShorts 
-                ? totalLongs - totalShorts 
+            uint256 imbalance = totalLongs > totalShorts
+                ? totalLongs - totalShorts
                 : totalShorts - totalLongs;
-            fundingRate = imbalance.mul(1e18).div(totalLongs + totalShorts);
+            fundingRate = imbalance * 1e18 / (totalLongs + totalShorts);
         }
     }
 
-    // Liquidation module
-    function liquidatePosition(address user, uint256 positionId) external {
-        Position storage position = positions[user][positionId];
-        (int256 currentPrice,) = _getPrice();
-        
-        require(_isUnderwater(position, currentPrice), "Position safe");
-        feeReserves[msg.sender] += position.collateral / 10; // 10% liquidation fee
-        
-        delete positions[user][positionId];
-        emit PositionLiquidated(user, positionId);
-    }
-
-    // Memory-based calculation
-    function _calculatePnl(Position memory position, int256 currentPrice) 
-        internal pure returns (uint256) 
+    function _calculatePnl(Position memory position, int256 currentPrice)
+        internal pure returns (uint256)
     {
-        int256 priceDelta = position.isLong 
-            ? currentPrice - position.entryPrice 
+        int256 priceDelta = position.isLong
+            ? currentPrice - position.entryPrice
             : position.entryPrice - currentPrice;
-            
         return uint256(priceDelta) * position.size / 1e8;
     }
 
-    // View functions for external interfaces
-    function getPosition(address user, uint256 positionId) 
-        external view returns (Position memory) 
+    function _isUnderwater(Position memory position, int256 currentPrice)
+        internal pure returns (bool)
+    {
+        // Simple check: if collateral < loss
+        int256 priceDelta = position.isLong
+            ? currentPrice - position.entryPrice
+            : position.entryPrice - currentPrice;
+        int256 pnl = priceDelta * int256(uint256(position.size)) / 1e8;
+        return int256(uint256(position.collateral)) + pnl <= 0;
+    }
+
+    // --- View Functions ---
+    function getPosition(address user, uint256 positionId)
+        external view returns (Position memory)
     {
         return positions[user][positionId];
     }
 }
-
-library SafeMath {
-    // Omitted for brevity - use OpenZeppelin's SafeMath
-}
-

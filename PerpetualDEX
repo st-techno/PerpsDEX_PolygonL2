@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.21;
+
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract PerpetualDEX {
+    using SafeMath for uint256;
+    
+    // Gas-optimized struct packing
+    struct Position {
+        uint128 size;
+        uint128 collateral;
+        int128 entryPrice;
+        bool isLong;
+        uint32 timestamp;
+        uint80 leverage;
+    }
+
+    // Gas-efficient storage layout
+    address public immutable collateralToken;
+    AggregatorV3Interface public immutable priceFeed;
+    
+    uint256 public totalLongs;
+    uint256 public totalShorts;
+    uint256 public fundingRate;
+    uint256 public constant FUNDING_INTERVAL = 8 hours;
+    
+    mapping(address => Position[]) public positions;
+    mapping(address => uint256) public feeReserves;
+
+    // Events for off-chain tracking
+    event PositionOpened(address indexed user, uint256 indexed positionId);
+    event PositionClosed(address indexed user, uint256 indexed positionId);
+    event PositionLiquidated(address indexed user, uint256 indexed positionId);
+
+    constructor(address _collateralToken, address _priceFeed) {
+        collateralToken = _collateralToken;
+        priceFeed = AggregatorV3Interface(_priceFeed);
+    }
+
+    // Gas-optimized main functions
+    function openPosition(
+        uint256 size,
+        uint256 collateral,
+        bool isLong,
+        uint80 leverage
+    ) external {
+        require(leverage <= 100, "Exceeds max leverage");
+        
+        _transferCollateral(collateral);
+        _updateFundingRate();
+        
+        (int256 currentPrice,) = _getPrice();
+        uint256 fee = _calculateFee(size);
+        
+        positions[msg.sender].push(Position({
+            size: uint128(size),
+            collateral: uint128(collateral),
+            entryPrice: int128(currentPrice),
+            isLong: isLong,
+            timestamp: uint32(block.timestamp),
+            leverage: leverage
+        }));
+        
+        _updateOpenInterest(isLong, size);
+        feeReserves[msg.sender] += fee;
+        
+        emit PositionOpened(msg.sender, positions[msg.sender].length - 1);
+    }
+
+    function closePosition(uint256 positionId) external {
+        Position storage position = positions[msg.sender][positionId];
+        require(position.size > 0, "Invalid position");
+        
+        _updateFundingRate();
+        (int256 currentPrice,) = _getPrice();
+        
+        uint256 pnl = _calculatePnl(position, currentPrice);
+        uint256 totalAmount = position.collateral + pnl;
+        
+        delete positions[msg.sender][positionId];
+        _updateOpenInterest(position.isLong, -int256(position.size));
+        
+        _transfer(msg.sender, totalAmount);
+        emit PositionClosed(msg.sender, positionId);
+    }
+
+    // Gas-efficient price retrieval
+    function _getPrice() internal view returns (int256, uint256) {
+        (, int256 price,, uint256 updatedAt,) = priceFeed.latestRoundData();
+        require(updatedAt >= block.timestamp - 60, "Stale price");
+        return (price, updatedAt);
+    }
+
+    // Optimized fee calculation
+    function _calculateFee(uint256 size) internal pure returns (uint256) {
+        return size.mul(5).div(10000); // 0.05% fee
+    }
+
+    // Batch-compatible collateral handling
+    function _transferCollateral(uint256 amount) internal {
+        IERC20(collateralToken).transferFrom(msg.sender, address(this), amount);
+    }
+
+    // Gas-efficient storage management
+    function _updateOpenInterest(bool isLong, uint256 amount) internal {
+        if (isLong) {
+            totalLongs += amount;
+        } else {
+            totalShorts += amount;
+        }
+    }
+
+    // Funding rate mechanism
+    function _updateFundingRate() internal {
+        if (block.timestamp % FUNDING_INTERVAL == 0) {
+            uint256 imbalance = totalLongs > totalShorts 
+                ? totalLongs - totalShorts 
+                : totalShorts - totalLongs;
+            fundingRate = imbalance.mul(1e18).div(totalLongs + totalShorts);
+        }
+    }
+
+    // Liquidation module
+    function liquidatePosition(address user, uint256 positionId) external {
+        Position storage position = positions[user][positionId];
+        (int256 currentPrice,) = _getPrice();
+        
+        require(_isUnderwater(position, currentPrice), "Position safe");
+        feeReserves[msg.sender] += position.collateral / 10; // 10% liquidation fee
+        
+        delete positions[user][positionId];
+        emit PositionLiquidated(user, positionId);
+    }
+
+    // Memory-based calculation
+    function _calculatePnl(Position memory position, int256 currentPrice) 
+        internal pure returns (uint256) 
+    {
+        int256 priceDelta = position.isLong 
+            ? currentPrice - position.entryPrice 
+            : position.entryPrice - currentPrice;
+            
+        return uint256(priceDelta) * position.size / 1e8;
+    }
+
+    // View functions for external interfaces
+    function getPosition(address user, uint256 positionId) 
+        external view returns (Position memory) 
+    {
+        return positions[user][positionId];
+    }
+}
+
+library SafeMath {
+    // Omitted for brevity - use OpenZeppelin's SafeMath
+}
+
